@@ -10,7 +10,8 @@ import {
   inject,
   Ref,
   watch,
-  SetupContext
+  SetupContext,
+  computed
 } from '@vue/runtime-test'
 
 describe('renderer: component', () => {
@@ -295,5 +296,62 @@ describe('renderer: component', () => {
       __DEV__ = true
       expect(serializeInner(root)).toBe(`<h1>1</h1>`)
     })
+  })
+
+  test('the component VNode should be cloned when reusing it', () => {
+    const App = {
+      render() {
+        const c = [h(Comp)]
+        return [c, c, c]
+      }
+    }
+
+    const ids: number[] = []
+    const Comp = {
+      render: () => h('h1'),
+      beforeUnmount() {
+        ids.push((this as any).$.uid)
+      }
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(App), root)
+    expect(serializeInner(root)).toBe(`<h1></h1><h1></h1><h1></h1>`)
+
+    render(null, root)
+    expect(serializeInner(root)).toBe(``)
+    expect(ids).toEqual([ids[0], ids[0] + 1, ids[0] + 2])
+  })
+
+  test('computed that did not change should not trigger re-render', async () => {
+    const src = ref(0)
+    const c = computed(() => src.value % 2)
+    const spy = jest.fn()
+    const App = {
+      render() {
+        spy()
+        return c.value
+      }
+    }
+
+    const root = nodeOps.createElement('div')
+    render(h(App), root)
+    expect(serializeInner(root)).toBe(`0`)
+    expect(spy).toHaveBeenCalledTimes(1)
+
+    // verify it updates
+    src.value = 1
+    src.value = 2
+    src.value = 3
+    await nextTick()
+    expect(serializeInner(root)).toBe(`1`)
+    expect(spy).toHaveBeenCalledTimes(2) // should only update once
+
+    // verify it updates
+    src.value = 4
+    src.value = 5
+    await nextTick()
+    expect(serializeInner(root)).toBe(`1`)
+    expect(spy).toHaveBeenCalledTimes(2) // should not need to update
   })
 })

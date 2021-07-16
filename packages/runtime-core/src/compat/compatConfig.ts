@@ -398,9 +398,10 @@ export const deprecationData: Record<DeprecationTypes, DeprecationData> = {
           DeprecationTypes.COMPONENT_V_MODEL
         }: false }\`.`
       if (
-        comp.props && isArray(comp.props)
+        comp.props &&
+        (isArray(comp.props)
           ? comp.props.includes('modelValue')
-          : hasOwn(comp.props, 'modelValue')
+          : hasOwn(comp.props, 'modelValue'))
       ) {
         return (
           `Component delcares "modelValue" prop, which is Vue 3 usage, but ` +
@@ -502,7 +503,7 @@ export function warnDeprecation(
       typeof message === 'function' ? message(...args) : message
     }${link ? `\n  Details: ${link}` : ``}`
   )
-  if (!isCompatEnabled(key, instance)) {
+  if (!isCompatEnabled(key, instance, true)) {
     console.error(
       `^ The above deprecation's compat behavior is disabled and will likely ` +
         `lead to runtime errors.`
@@ -531,7 +532,10 @@ const seenConfigObjects = /*#__PURE__*/ new WeakSet<CompatConfig>()
 const warnedInvalidKeys: Record<string, boolean> = {}
 
 // dev only
-export function validateCompatConfig(config: CompatConfig) {
+export function validateCompatConfig(
+  config: CompatConfig,
+  instance?: ComponentInternalInstance
+) {
   if (seenConfigObjects.has(config)) {
     return
   }
@@ -548,8 +552,8 @@ export function validateCompatConfig(config: CompatConfig) {
           warn(
             `Deprecation config "${key}" is compiler-specific and you are ` +
               `running a runtime-only build of Vue. This deprecation should be ` +
-              `configured via compiler options in your build setup instead.`
-            // TODO link to migration build docs on build setup
+              `configured via compiler options in your build setup instead.\n` +
+              `Details: https://v3.vuejs.org/guide/migration/migration-build.html`
           )
         }
       } else {
@@ -557,6 +561,14 @@ export function validateCompatConfig(config: CompatConfig) {
       }
       warnedInvalidKeys[key] = true
     }
+  }
+
+  if (instance && config[DeprecationTypes.OPTIONS_DATA_MERGE] != null) {
+    warn(
+      `Deprecation config "${
+        DeprecationTypes.OPTIONS_DATA_MERGE
+      }" can only be configured globally.`
+    )
   }
 }
 

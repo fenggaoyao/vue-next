@@ -27,6 +27,7 @@ import {
   shallowRef,
   Ref
 } from '@vue/reactivity'
+import { watchPostEffect } from '../src/apiWatch'
 
 // reference: https://vue-composition-api-rfc.netlify.com/api.html#watch
 
@@ -349,6 +350,32 @@ describe('api: watch', () => {
           },
           { flush: 'post' }
         )
+        return () => count.value
+      }
+    }
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(assertion).toHaveBeenCalledTimes(1)
+    expect(result).toBe(true)
+
+    count.value++
+    await nextTick()
+    expect(assertion).toHaveBeenCalledTimes(2)
+    expect(result).toBe(true)
+  })
+
+  it('watchPostEffect', async () => {
+    const count = ref(0)
+    let result
+    const assertion = jest.fn(count => {
+      result = serializeInner(root) === `${count}`
+    })
+
+    const Comp = {
+      setup() {
+        watchPostEffect(() => {
+          assertion(count.value)
+        })
         return () => count.value
       }
     }
@@ -848,15 +875,16 @@ describe('api: watch', () => {
     render(h(Comp), nodeOps.createElement('div'))
 
     expect(instance!).toBeDefined()
-    expect(instance!.effects).toBeInstanceOf(Array)
-    expect(instance!.effects!.length).toBe(1)
+    expect(instance!.scope.effects).toBeInstanceOf(Array)
+    // includes the component's own render effect AND the watcher effect
+    expect(instance!.scope.effects!.length).toBe(2)
 
     _show!.value = false
 
     await nextTick()
     await nextTick()
 
-    expect(instance!.effects![0].active).toBe(false)
+    expect(instance!.scope.effects![0].active).toBe(false)
   })
 
   test('this.$watch should pass `this.proxy` to watch source as the first argument ', () => {
@@ -876,6 +904,22 @@ describe('api: watch', () => {
 
     expect(instance).toBeDefined()
     expect(source).toHaveBeenCalledWith(instance)
+  })
+
+  test('should not leak `this.proxy` to setup()', () => {
+    const source = jest.fn()
+
+    const Comp = defineComponent({
+      render() {},
+      setup() {
+        watch(source, () => {})
+      }
+    })
+
+    const root = nodeOps.createElement('div')
+    createApp(Comp).mount(root)
+    // should not have any arguments
+    expect(source.mock.calls[0]).toMatchObject([])
   })
 
   // #2728
@@ -944,7 +988,7 @@ describe('api: watch', () => {
     await nextTick()
     expect(spy).toHaveBeenCalledTimes(2)
   })
-  
+
   it('watching sources: ref<any[]>', async () => {
     const foo = ref([1])
     const spy = jest.fn()

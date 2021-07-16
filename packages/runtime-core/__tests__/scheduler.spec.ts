@@ -230,6 +230,16 @@ describe('scheduler', () => {
       await nextTick()
       expect(calls).toEqual(['cb1', 'cb2', 'job1'])
     })
+
+    // #3806
+    it('queue preFlushCb inside postFlushCb', async () => {
+      const cb = jest.fn()
+      queuePostFlushCb(() => {
+        queuePreFlushCb(cb)
+      })
+      await nextTick()
+      expect(cb).toHaveBeenCalled()
+    })
   })
 
   describe('queuePostFlushCb', () => {
@@ -557,5 +567,27 @@ describe('scheduler', () => {
 
     await nextTick()
     expect(count).toBe(1)
+  })
+
+  // #910
+  test('should not run stopped reactive effects', async () => {
+    const spy = jest.fn()
+
+    // simulate parent component that toggles child
+    const job1 = () => {
+      // @ts-ignore
+      job2.active = false
+    }
+    // simulate child that's triggered by the same reactive change that
+    // triggers its toggle
+    const job2 = () => spy()
+    expect(spy).toHaveBeenCalledTimes(0)
+
+    queueJob(job1)
+    queueJob(job2)
+    await nextTick()
+
+    // should not be called
+    expect(spy).toHaveBeenCalledTimes(0)
   })
 })

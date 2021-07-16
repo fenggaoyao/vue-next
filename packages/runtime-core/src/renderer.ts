@@ -19,6 +19,7 @@ import {
   ComponentOptions,
   createComponentInstance,
   Data,
+  getExposeProxy,
   setupComponent
 } from './component'
 import {
@@ -47,15 +48,13 @@ import {
   flushPostFlushCbs,
   invalidateJob,
   flushPreFlushCbs,
-  SchedulerCb
+  SchedulerJob
 } from './scheduler'
 import {
-  effect,
-  stop,
-  ReactiveEffectOptions,
   isRef,
   pauseTracking,
-  resetTracking
+  resetTracking,
+  ReactiveEffect
 } from '@vue/reactivity'
 import { updateProps } from './componentProps'
 import { updateSlots } from './componentSlots'
@@ -94,7 +93,7 @@ export interface Renderer<HostElement = RendererElement> {
   createApp: CreateAppFunction<HostElement>
 }
 
-export interface HydrationRenderer extends Renderer<Element> {
+export interface HydrationRenderer extends Renderer<Element | ShadowRoot> {
   hydrate: RootHydrateFunction
 }
 
@@ -142,7 +141,7 @@ export interface RendererOptions<
     parent: HostElement,
     anchor: HostNode | null,
     isSVG: boolean
-  ): HostElement[]
+  ): [HostNode, HostNode]
 }
 
 // Renderer Node can technically be any object in the context of core renderer
@@ -285,23 +284,6 @@ export const enum MoveType {
   REORDER
 }
 
-const prodEffectOptions = {
-  scheduler: queueJob,
-  // #1801, #2043 component render effects should allow recursive updates
-  allowRecurse: true
-}
-
-function createDevEffectOptions(
-  instance: ComponentInternalInstance
-): ReactiveEffectOptions {
-  return {
-    scheduler: queueJob,
-    allowRecurse: true,
-    onTrack: instance.rtc ? e => invokeArrayFns(instance.rtc!, e) : void 0,
-    onTrigger: instance.rtg ? e => invokeArrayFns(instance.rtg!, e) : void 0
-  }
-}
-
 export const queuePostRenderEffect = __FEATURE_SUSPENSE__
   ? queueEffectWithSuspense
   : queuePostFlushCb
@@ -334,7 +316,7 @@ export const setRef = (
 
   const refValue =
     vnode.shapeFlag & ShapeFlags.STATEFUL_COMPONENT
-      ? vnode.component!.exposed || vnode.component!.proxy
+      ? getExposeProxy(vnode.component!) || vnode.component!.proxy
       : vnode.el
   const value = isUnmount ? null : refValue
 
@@ -377,7 +359,7 @@ export const setRef = (
     // null values means this is unmount and it should not overwrite another
     // ref with the same key
     if (value) {
-      ;(doSet as SchedulerCb).id = -1
+      ;(doSet as SchedulerJob).id = -1
       queuePostRenderEffect(doSet, parentSuspense)
     } else {
       doSet()
@@ -387,7 +369,7 @@ export const setRef = (
       ref.value = value
     }
     if (value) {
-      ;(doSet as SchedulerCb).id = -1
+      ;(doSet as SchedulerJob).id = -1
       queuePostRenderEffect(doSet, parentSuspense)
     } else {
       doSet()
@@ -486,7 +468,7 @@ function baseCreateRenderer(
     parentSuspense = null,
     isSVG = false,
     slotScopeIds = null,
-    optimized = false
+    optimized = __DEV__ && isHmrUpdating ? false : !!n2.dynamicChildren
   ) => {
     // patching & not same type, unmount old tree
     if (n1 && !isSameVNodeType(n1, n2)) {
@@ -771,7 +753,7 @@ function baseCreateRenderer(
           parentSuspense,
           isSVG && type !== 'foreignObject',
           slotScopeIds,
-          optimized || !!vnode.dynamicChildren
+          optimized
         )
       }
 
@@ -1073,16 +1055,19 @@ function baseCreateRenderer(
       const newVNode = newChildren[i]
       // Determine the container (parent element) for the patch.
       const container =
+        // oldVNode may be an errored async setup() component inside Suspense
+        // which will not have a mounted element
+        oldVNode.el &&
         // - In the case of a Fragment, we need to provide the actual parent
         // of the Fragment itself so it can move its children.
-        oldVNode.type === Fragment ||
-        // - In the case of different nodes, there is going to be a replacement
-        // which also requires the correct parent container
-        !isSameVNodeType(oldVNode, newVNode) ||
-        // - In the case of a component, it could contain anything.
-        oldVNode.shapeFlag & ShapeFlags.COMPONENT ||
-        oldVNode.shapeFlag & ShapeFlags.TELEPORT
-          ? hostParentNode(oldVNode.el!)!
+        (oldVNode.type === Fragment ||
+          // - In the case of different nodes, there is going to be a replacement
+          // which also requires the correct parent container
+          !isSameVNodeType(oldVNode, newVNode) ||
+          // - In the case of a component, it could contain anything.
+          oldVNode.shapeFlag & ShapeFlags.COMPONENT ||
+          oldVNode.shapeFlag & ShapeFlags.TELEPORT)
+          ? hostParentNode(oldVNode.el)!
           : // In other cases, the parent container is not actually used so we
             // just pass the block element here to avoid a DOM parentNode call.
             fallbackContainer
@@ -1167,7 +1152,7 @@ function baseCreateRenderer(
     const fragmentEndAnchor = (n2.anchor = n1 ? n1.anchor : hostCreateText(''))!
 
     let { patchFlag, dynamicChildren, slotScopeIds: fragmentSlotScopeIds } = n2
-    if (patchFlag > 0) {
+    if (dynamicChildren) {
       optimized = true
     }
 
@@ -1301,7 +1286,8 @@ function baseCreateRenderer(
   ) => {
     // 2.x compat may pre-creaate the component instance before actually
     // mounting
-    const compatMountInstance = __COMPAT__ && initialVNode.component
+    const compatMountInstance =
+      __COMPAT__ && initialVNode.isCompatRoot && initialVNode.component
     const instance: ComponentInternalInstance =
       compatMountInstance ||
       (initialVNode.component = createComponentInstance(
@@ -1389,7 +1375,7 @@ function baseCreateRenderer(
         // in case the child component is also queued, remove it to avoid
         // double updating the same child component in the same flush.
         invalidateJob(instance.update)
-        // instance.update is the reactive effect runner.
+        // instance.update is the reactive effect.
         instance.update()
       }
     } else {
@@ -1409,13 +1395,13 @@ function baseCreateRenderer(
     isSVG,
     optimized
   ) => {
-    // create reactive effect for rendering
-    instance.update = effect(function componentEffect() {
+    const componentUpdateFn = () => {
       if (!instance.isMounted) {
         let vnodeHook: VNodeHook | null | undefined
         const { el, props } = initialVNode
         const { bm, m, parent } = instance
 
+        effect.allowRecurse = false
         // beforeMount hook
         if (bm) {
           invokeArrayFns(bm)
@@ -1430,6 +1416,7 @@ function baseCreateRenderer(
         ) {
           instance.emit('hook:beforeMount')
         }
+        effect.allowRecurse = true
 
         if (el && hydrateNode) {
           // vnode has adopted host node - perform hydration instead of mount.
@@ -1462,7 +1449,7 @@ function baseCreateRenderer(
               // which means it won't track dependencies - but it's ok because
               // a server-rendered async wrapper is already in resolved state
               // and it will never need to change.
-              hydrateSubTree
+              () => !instance.isUnmounted && hydrateSubTree()
             )
           } else {
             hydrateSubTree()
@@ -1555,6 +1542,8 @@ function baseCreateRenderer(
           next = vnode
         }
 
+        // Disallow component effect recursion during pre-lifecycle hooks.
+        effect.allowRecurse = false
         // beforeUpdate hook
         if (bu) {
           invokeArrayFns(bu)
@@ -1569,6 +1558,7 @@ function baseCreateRenderer(
         ) {
           instance.emit('hook:beforeUpdate')
         }
+        effect.allowRecurse = true
 
         // render
         if (__DEV__) {
@@ -1634,12 +1624,33 @@ function baseCreateRenderer(
           popWarningContext()
         }
       }
-    }, __DEV__ ? createDevEffectOptions(instance) : prodEffectOptions)
+    }
+
+    // create reactive effect for rendering
+    const effect = new ReactiveEffect(
+      componentUpdateFn,
+      () => queueJob(instance.update),
+      instance.scope // track it in component's effect scope
+    )
+
+    const update = (instance.update = effect.run.bind(effect) as SchedulerJob)
+    update.id = instance.uid
+    // allowRecurse
+    // #1801, #2043 component render effects should allow recursive updates
+    effect.allowRecurse = update.allowRecurse = true
 
     if (__DEV__) {
-      // @ts-ignore
-      instance.update.ownerInstance = instance
+      effect.onTrack = instance.rtc
+        ? e => invokeArrayFns(instance.rtc!, e)
+        : void 0
+      effect.onTrigger = instance.rtg
+        ? e => invokeArrayFns(instance.rtg!, e)
+        : void 0
+      // @ts-ignore (for scheduler)
+      update.ownerInstance = instance
     }
+
+    update()
   }
 
   const updateComponentPreRender = (
@@ -2279,12 +2290,13 @@ function baseCreateRenderer(
       unregisterHMR(instance)
     }
 
-    const { bum, effects, update, subTree, um } = instance
+    const { bum, scope, update, subTree, um } = instance
 
     // beforeUnmount hook
     if (bum) {
       invokeArrayFns(bum)
     }
+
     if (
       __COMPAT__ &&
       isCompatEnabled(DeprecationTypes.INSTANCE_EVENT_HOOKS, instance)
@@ -2292,15 +2304,15 @@ function baseCreateRenderer(
       instance.emit('hook:beforeDestroy')
     }
 
-    if (effects) {
-      for (let i = 0; i < effects.length; i++) {
-        stop(effects[i])
-      }
+    if (scope) {
+      scope.stop()
     }
+
     // update may be null if a component is unmounted before its async
     // setup has resolved.
     if (update) {
-      stop(update)
+      // so that scheduler will no longer invoke it
+      update.active = false
       unmount(subTree, instance, parentSuspense, doRemove)
     }
     // unmounted hook
